@@ -16,6 +16,7 @@ A pure‑Python **pre‑commit** hook that enforces repository access policy fro
 * **Admin‑only policy edits**: only `config_admins` can modify `config/hook_policy.json`. This rule is **not bypassable**.
 * **Emergency bypass** (optional, auditable): `DV_HOOK_BYPASS` + `DV_HOOK_BYPASS_REASON` for users permitted by policy and holding a valid token (SHA‑256 stored in policy). Supports **reusable** or **one‑time** tokens and optional expiry. Usage is logged to `simlog/precommit_access.log` and `.git/dv-hooks/bypass_ledger.json`.
 * **Logging**: All decisions appended to `simlog/precommit_access.log`.
+* **Freeze windows**: toggle-based (on/off) or local-time date windows for selected paths (e.g., `tb/**`). Freeze overrides all other allows; during freeze only `allowed_users` can commit with a valid token (`DV_HOOK_BYPASS` + `DV_HOOK_BYPASS_REASON`).
 
 ---
 
@@ -88,13 +89,21 @@ A pure‑Python **pre‑commit** hook that enforces repository access policy fro
     "allowed_users": ["Ajinkya", "Vishal"],
     "require_reason": true,
     "tokens": [
-      {
-        "label": "OpsWindow",
-        "sha256": "<SHA256_OF_SECRET_TOKEN>",
-        "reusable": false,
-        "expires": "2025-12-31"
-      }
+      { "label": "OpsWindow", "sha256": "<SHA256>", "reusable": false, "expires": "2025-12-31 00:00:00" }
     ]
+  },
+  "freeze": {
+    "enabled": true,
+    "branch": "main",
+    "windows": [
+      { "paths": ["tb/**"] }  
+    ],
+    "allowed_users": ["Ajinkya K", "Vishal"],
+    "require_reason": true,
+    "tokens": [
+      { "label": "Freeze-Sep", "sha256": "<SHA256_OF_FREEZE_TOKEN>", "reusable": false, "expires": "2025-09-09 00:00:00" }
+    ],
+    "priority": "override_all"
   }
 }
 ```
@@ -148,18 +157,16 @@ A pure‑Python **pre‑commit** hook that enforces repository access policy fro
 
 ## How decisions are made
 
-1. The hook reads staged changes via `git diff --cached --name-status -M` (detects renames).
-2. If `config/hook_policy.json` is staged by a non‑admin → **block** (not bypassable).
-3. For each change:
-
-   * **Global extension bypass** (non‑delete) → allow.
-   * If a **delete/rename** originates in a **deletion\_protected** path → admin‑only (can be bypassed only via emergency token; policy edits remain non‑bypassable).
-   * Match **locked** entries → block; unless per‑entry `allowed_extensions` allows the file type.
-   * Else match **restricted** entries → allow only if author ∈ `allowed_users` or per‑entry extension exception matches.
-   * Else → allow by default.
-4. All decisions are logged to `simlog/precommit_access.log`.
-5. If any blocks remain and **emergency bypass** is enabled and correctly provided, they may be converted to **BYPASS‑ALLOW** (audited) depending on token validity.
-6. If blocks remain without valid bypass → commit fails.
+1. Read staged changes via `git diff --cached --name-status -M` (detects renames/moves).
+2. If `config/hook_policy.json` is staged by a non‑admin → **block** (never bypassable).
+3. **Freeze check** (if `freeze.enabled=true`): if current time is inside any active window and path matches a frozen pattern, mark as **BLOCK (freeze active)**. This step runs **before** all other checks when `priority=override_all`.
+4. **Deletion protection**: deletes/renames from `deletion_protected` paths are **admin‑only**.
+5. **Global extension bypass** (non‑deletes): if extension matches global allowlist (e.g., `.md/.txt/.csv`) → allow.
+6. **Locked** entries: block unless per‑entry `allowed_extensions` permits the file type.
+7. **Restricted** entries: allow only if author ∈ `allowed_users` or per‑entry extension exception matches.
+8. Log every decision to `simlog/precommit_access.log`.
+9. **Bypass evaluation order**: first try **Freeze bypass** (for freeze violations) using `freeze.tokens`; then try **Emergency bypass** (for any remaining violations) using `emergency_bypass.tokens`. Both require `DV_HOOK_BYPASS` and, if configured, `DV_HOOK_BYPASS_REASON`.
+10. If violations remain → fail the commit with a clear list of offending paths.
 
 ---
 
@@ -199,6 +206,58 @@ A pure‑Python **pre‑commit** hook that enforces repository access policy fro
 
 ---
 
+## Freeze windows (release mode)
+
+Two supported modes (no timezone complexity):
+
+### Option A — Toggle (simplest)
+
+Freeze is active whenever `enabled: true`. No dates required.
+
+```json
+"freeze": {
+  "enabled": true,
+  "branch": "main",
+  "windows": [ { "paths": ["tb/**"] } ],
+  "allowed_users": ["Ajinkya K", "Vishal"],
+  "require_reason": true,
+  "tokens": [
+    { "label": "Freeze-Sep", "sha256": "<SHA256_OF_FREEZE_TOKEN>", "reusable": false, "expires": "2025-09-09 00:00:00" }
+  ],
+  "priority": "override_all"
+}
+```
+
+### Option B — Local-time windows (no offsets)
+
+Provide `from`/`to` in local machine time (e.g., `YYYY-MM-DD HH:MM:SS`). **Do not** include `+05:30` or `Z`.
+
+```json
+"freeze": {
+  "enabled": true,
+  "branch": "main",
+  "windows": [
+    { "from": "2025-08-29 00:00:00", "to": "2025-08-31 23:59:59", "paths": ["tb/**"] }
+  ],
+  "allowed_users": ["Ajinkya K", "Vishal"],
+  "require_reason": true,
+  "tokens": [
+    { "label": "Freeze-Sep", "sha256": "<SHA256_OF_FREEZE_TOKEN>", "reusable": false, "expires": "2025-09-09 00:00:00" }
+  ],
+  "priority": "override_all"
+}
+```
+
+**Behavior**: During freeze, all changes under frozen paths are blocked. Users in `allowed_users` can commit by setting `DV_HOOK_BYPASS` (plaintext token) and `DV_HOOK_BYPASS_REASON`.
+
+**Notes**:
+
+* Prefer **Option A** for reliability across machines.
+* For Option B, make sure teammates agree on a common local timezone or pre‑convert the window.
+* Freeze tokens are **separate** from `emergency_bypass.tokens`. The hook first resolves **Freeze bypass**, then **Emergency bypass**.
+
+---
+
 ## Troubleshooting
 
 * **“Python was not found …” (Windows):** Install Python and ensure `python` is on PATH. Our shebang uses `env python` to work with `python.exe`.
@@ -214,13 +273,14 @@ A pure‑Python **pre‑commit** hook that enforces repository access policy fro
 
 * Forbidden extensions & LFS enforcement
 * Size limits per extension (e.g., block `.vcd` > N MB)
-* Linters/formatters per extension (e.g., Verible, clang‑format, black)
+* Linters/formatters per extension (Verible, clang‑format, black)
 * Dry‑run/test gates (e.g., call `script/runTest.sh` when `tb/tests/**` changes)
-* Branch‑aware policies and freeze windows
+* Branch‑aware policies
 * Commit‑message policies (tickets, sign‑off, GPG)
 
 ---
 
 ## Changelog
 
+* **2025‑08‑29** — v1.1: Added **Freeze windows (release mode)** with two modes: toggle and local‑time windows. Updated policy examples, decision order, and troubleshooting. No timezone handling required.
 * **2025‑08‑29** — v1 initial: locked/restricted areas, global/per‑path extension exceptions, deletion protection (admin‑only), admin‑only policy edits, emergency bypass with tokens, full logging & ledger.
