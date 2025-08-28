@@ -17,6 +17,7 @@ A pure‑Python **pre‑commit** hook that enforces repository access policy fro
 * **Emergency bypass** (optional, auditable): `DV_HOOK_BYPASS` + `DV_HOOK_BYPASS_REASON` for users permitted by policy and holding a valid token (SHA‑256 stored in policy). Supports **reusable** or **one‑time** tokens and optional expiry. Usage is logged to `simlog/precommit_access.log` and `.git/dv-hooks/bypass_ledger.json`.
 * **Logging**: All decisions appended to `simlog/precommit_access.log`.
 * **Freeze windows**: toggle-based (on/off) or local-time date windows for selected paths (e.g., `tb/**`). Freeze overrides all other allows; during freeze only `allowed_users` can commit with a valid token (`DV_HOOK_BYPASS` + `DV_HOOK_BYPASS_REASON`).
+* **Smoke test gate**: auto-runs fast checks when risky areas change. TB changes trigger `cdtc cpuss__sanity`, `runTest -do compile`, `runTest -do elab`. SW header changes trigger `cdtc cpuss__Sanity`, `runTest -do sw`. Fails can be `warn` or `block`, output saved to `simlog/smoke.log`.
 
 ---
 
@@ -62,51 +63,56 @@ A pure‑Python **pre‑commit** hook that enforces repository access policy fro
 
 **Location:** `config/hook_policy.json` (version‑controlled). Only `config_admins` may modify it. All behavior is driven from here.
 
-### Minimal working example (valid JSON)
-
-```json
-{
-  "version": 1,
-  "config_admins": ["Ajinkya"],
-  "options": {
-    "case_sensitive_users": true,
-    "expand_env": true,
-    "treat_patterns_as_absolute_when_starting_with_slash": true,
-    "log_path": "simlog/precommit_access.log"
-  },
-  "global_bypass": { "allowed_extensions": [".md", ".txt", ".csv"] },
-  "locked": [ { "path": "design/**" } ],
-  "restricted": [
-    {
-      "path": "sw/**",
-      "allowed_users": ["Vishal", "Ashraf"],
-      "allowed_extensions": [".md", ".txt"]
-    }
-  ],
-  "deletion_protected": ["design/**", "sw/**"],
-  "emergency_bypass": {
-    "enabled": true,
-    "allowed_users": ["Ajinkya", "Vishal"],
-    "require_reason": true,
-    "tokens": [
-      { "label": "OpsWindow", "sha256": "<SHA256>", "reusable": false, "expires": "2025-12-31 00:00:00" }
-    ]
-  },
-  "freeze": {
-    "enabled": true,
-    "branch": "main",
-    "windows": [
-      { "paths": ["tb/**"] }  
-    ],
-    "allowed_users": ["Ajinkya K", "Vishal"],
-    "require_reason": true,
-    "tokens": [
-      { "label": "Freeze-Sep", "sha256": "<SHA256_OF_FREEZE_TOKEN>", "reusable": false, "expires": "2025-09-09 00:00:00" }
-    ],
-    "priority": "override_all"
-  }
+\$1{
+"version": 1,
+"config\_admins": \["Ajinkya"],
+"options": {
+"case\_sensitive\_users": true,
+"expand\_env": true,
+"treat\_patterns\_as\_absolute\_when\_starting\_with\_slash": true,
+"log\_path": "simlog/precommit\_access.log",
+"ui": { "color": true, "show\_hints": true, "show\_admins": true, "show\_allowed\_users": true, "max\_files\_per\_group": 20 }
+},
+"global\_bypass": { "allowed\_extensions": \[".md", ".txt", ".csv"] },
+"locked": \[ { "path": "design/**" } ],
+"restricted": \[
+{ "path": "sw/**", "allowed\_users": \["Vishal", "Ashraf"], "allowed\_extensions": \[".md", ".txt"] }
+],
+"deletion\_protected": \["design/**", "sw/**"],
+"emergency\_bypass": {
+"enabled": true,
+"allowed\_users": \["Ajinkya", "Vishal"],
+"require\_reason": true,
+"tokens": \[ { "label": "OpsWindow", "sha256": "<SHA256>", "reusable": false, "expires": "2025-12-31 00:00:00" } ]
+},
+"freeze": {
+"enabled": true,
+"branch": "main",
+"windows": \[ { "paths": \["tb/**"] } ],
+"allowed\_users": \["Ajinkya K", "Vishal"],
+"require\_reason": true,
+"tokens": \[ { "label": "Freeze-Sep", "sha256": "\<SHA256\_OF\_FREEZE\_TOKEN>", "reusable": false, "expires": "2025-09-09 00:00:00" } ],
+"priority": "override\_all"
+},
+"smoke\_test": {
+"enabled": true,
+"mode": "warn",
+"timeout\_sec": 1200,
+"shell": "csh",
+"setup\_csh": "setup.csh",
+"paths\_compile\_elab": \["tb/**", "sim/**", "tb/agents/**", "tb/env/**"],
+"cmds\_compile\_elab": \[
+\["cdtc", "cpuss\_\_sanity"],
+\["runTest", "-do", "compile"],
+\["runTest", "-do", "elab"]
+],
+"sw\_header\_globs": \["sw/**/*.h", "sw/\*\*/*.hpp", "sw/\*\*/\*.hh"],
+"cmds\_sw": \[
+\["cdtc", "cpuss\_\_Sanity"],
+\["runTest", "-do", "sw"]
+]
 }
-```
+}\$3
 
 ### Field reference
 
@@ -165,8 +171,13 @@ A pure‑Python **pre‑commit** hook that enforces repository access policy fro
 6. **Locked** entries: block unless per‑entry `allowed_extensions` permits the file type.
 7. **Restricted** entries: allow only if author ∈ `allowed_users` or per‑entry extension exception matches.
 8. Log every decision to `simlog/precommit_access.log`.
-9. **Bypass evaluation order**: first try **Freeze bypass** (for freeze violations) using `freeze.tokens`; then try **Emergency bypass** (for any remaining violations) using `emergency_bypass.tokens`. Both require `DV_HOOK_BYPASS` and, if configured, `DV_HOOK_BYPASS_REASON`.
-10. If violations remain → fail the commit with a clear list of offending paths.
+9. **Bypass order**: first attempt **Freeze bypass**, then **Emergency bypass** (if enabled).
+10. **Smoke Test Gate** (if enabled and no violations remain):
+
+    * If TB/sim risky paths changed → run `cdtc cpuss__sanity`, `runTest -do compile`, `runTest -do elab`.
+    * If C/C++ headers under `sw/**` changed → run `cdtc cpuss__Sanity`, `runTest -do sw`.
+    * Results recorded in `simlog/smoke.log`; failures either **warn** or **block** per `mode`.
+11. If violations remain → fail the commit with a clear list of offending paths.
 
 ---
 
@@ -258,6 +269,34 @@ Provide `from`/`to` in local machine time (e.g., `YYYY-MM-DD HH:MM:SS`). **Do no
 
 ---
 
+## Smoke Test Gate
+
+**What it does:** When risky areas change, the hook runs quick checks before the commit finalizes.
+
+* **TB / sim changes** → run in order: `cdtc cpuss__sanity`, `runTest -do compile`, `runTest -do elab`.
+* **SW header changes** (`sw/**/*.h`, `sw/**/*.hpp`, `sw/**/*.hh`) → run: `cdtc cpuss__Sanity`, `runTest -do sw`.
+
+**Config (in `smoke_test`):**
+
+* `enabled` (`true|false`): turn on/off.
+* `mode` (`"warn"|"block"`): whether failures block the commit.
+* `timeout_sec` (int): per-command timeout.
+* `shell` (`"csh"|"sh"`): use `csh` when your environment needs `source setup.csh`.
+* `setup_csh` (string): path to setup (e.g., `setup.csh`).
+* `paths_compile_elab` (globs): which paths trigger TB compile+elab checks.
+* `cmds_compile_elab` (array of argv arrays): commands to run for TB path changes.
+* `sw_header_globs` (globs): header patterns to trigger SW step.
+* `cmds_sw` (array): commands to run when headers are touched.
+
+**Logs:** Output is saved to `simlog/smoke.log`.
+
+**Tips:**
+
+* Start with `mode: "warn"`; flip to `"block"` once green and stable.
+* Make sure `cdtc` and `runTest` are on PATH (or available after `source setup.csh`).
+
+---
+
 ## Troubleshooting
 
 * **“Python was not found …” (Windows):** Install Python and ensure `python` is on PATH. Our shebang uses `env python` to work with `python.exe`.
@@ -282,5 +321,6 @@ Provide `from`/`to` in local machine time (e.g., `YYYY-MM-DD HH:MM:SS`). **Do no
 
 ## Changelog
 
-* **2025‑08‑29** — v1.1: Added **Freeze windows (release mode)** with two modes: toggle and local‑time windows. Updated policy examples, decision order, and troubleshooting. No timezone handling required.
+* **2025‑08‑29** — v1.2: Added **Smoke Test Gate** (TB compile+elab & SW header checks), JSON-configurable with `warn|block` modes; updated examples and decision flow.
+* **2025‑08‑29** — v1.1: Added **Freeze windows (release mode)** with two modes: toggle and local‑time windows. Updated policy examples, decision order, and troubleshooting.
 * **2025‑08‑29** — v1 initial: locked/restricted areas, global/per‑path extension exceptions, deletion protection (admin‑only), admin‑only policy edits, emergency bypass with tokens, full logging & ledger.
