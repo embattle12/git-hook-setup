@@ -1,0 +1,74 @@
+{
+  "version": 1,
+  "config_admins": ["Ajinkya K"],
+
+  "options": {
+    "case_sensitive_users": true,
+    "expand_env": true,
+    "treat_patterns_as_absolute_when_starting_with_slash": true,
+    "log_path": "simlog/precommit_access.log",
+  "ui": {
+    "color": true,              
+    "show_hints": true,         
+    "show_admins": false,        
+    "show_allowed_users": true, 
+    "max_files_per_group": 20
+  },
+
+  "global_bypass": { "allowed_extensions": [".md", ".txt", ".csv"] },
+
+  "locked": [{ "path": "design/**" }],
+
+  "restricted": [
+    {
+      "path": "sw/**",
+      "allowed_users": ["Vishal", "Ashraf"],
+      "allowed_extensions": [".md", ".txt"]
+    }
+  ],
+
+  "deletion_protected": ["design/**", "sw/**"],
+
+  "freeze": {
+    "enabled": false,                    
+    "branch": "main",                    
+    "windows": [
+      {
+        "from": "2025-08-29 00:00:00",
+        "to":   "2025-08-31 23:59:59",
+        "paths": ["tb/**"]               
+      }
+    ],
+    "allowed_users": ["Ajinkya K", "Vishal"],   
+    "require_reason": true,              
+    "tokens": [                          
+      {
+        "label": "SOS-1234",
+        "sha256": "c981febea31ccd77eb50d047da3bcc6d15909c4e7055eb1c0106df96b8b2e1b7",
+        "reusable": false,               
+        "expires": "2025-09-09"
+      }
+    ],
+    "priority": "override_all"           
+  },
+  
+  "smoke_test": {
+  "enabled": true,
+  "mode": "warn",                          
+  "timeout_sec": 1200,                      
+  "shell": "csh",                           
+  "setup_csh": "setup.csh",                 
+  "paths_compile_elab": ["tb/**", "sim/**", "tb/agents/**", "tb/env/**"],
+  "cmds_compile_elab": [
+    ["cdtc", "cpuss__sanity"],
+    ["runTest", "-do", "compile"],
+    ["runTest", "-do", "elab"]
+  ],
+  "sw_header_globs": ["sw/**/*.h", "sw/**/*.hpp", "sw/**/*.hh"],
+  "cmds_sw": [
+    ["cdtc", "cpuss__Sanity"],
+    ["runTest", "-do", "sw"]
+  ]
+ }
+ }
+}

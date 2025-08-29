@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Minimal cdtc stub used by the smoke gate. Simulates a quick suite/env setup.
+
+set -euo pipefail
+
+SUITE="${1:-cpuss__sanity}"
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  GRN=$'\033[32m'; RED=$'\033[31m'; BOLD=$'\033[1m'; RST=$'\033[0m'
+else
+  GRN=""; RED=""; BOLD=""; RST=""
+fi
+
+# Controls:
+#  CDTC_FAIL=1           -> always fail with rc 2
+#  CDTC_FAIL_ON="cpuss__Sanity" -> fail only for that suite
+if [[ "${CDTC_FAIL:-0}" == "1" ]] || [[ "${CDTC_FAIL_ON:-}" == "$SUITE" ]]; then
+  echo "[cdtc] ${RED}Simulated failure for suite '${SUITE}'${RST}"
+  exit 2
+fi
+
+echo "[cdtc] ${BOLD}Running suite '${SUITE}' (stub)${RST}"
+exit 0

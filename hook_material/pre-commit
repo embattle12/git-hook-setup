@@ -1,0 +1,682 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+DV Pre-commit Access Policy Hook — interactive UI + smoke tests
+
+Features
+- Locked & restricted paths with per-path extension exceptions
+- Global extension bypass (.md/.txt/.csv etc)
+- Admin-only deletes/renames in protected paths
+- Admin-only edits to config/hook_policy.json (never bypassable)
+- Freeze windows (toggle or local-time dates) with separate bypass tokens
+- Emergency bypass (one-time/reusable) with ledger & expiry
+- Smoke Test Gate: TB compile+elab; SW header step (warn|block)
+- Pretty, emoji-safe colored output; helpful hints
+
+Env toggles
+- NO_COLOR=1                 -> disable color
+- DV_HOOK_MUTE=1             -> minimal output
+- DV_HOOK_TIPS=0             -> hide hints
+- DV_HOOK_SHOW_DECISIONS=1   -> print per-file decisions (debug)
+- DV_HOOK_BOX_MIN=72         -> min inner width for boxes (optional)
+"""
+
+import os, sys, json, getpass, subprocess, re, unicodedata
+from datetime import datetime
+from pathlib import PurePosixPath
+import shutil
+# ---------------- subprocess helpers ----------------
+def run(cmd):
+    return subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True
+    ).stdout
+
+def repo_root():
+    return run(["git", "rev-parse", "--show-toplevel"]).strip()
+
+def branch_name():
+    return run(["git", "rev-parse", "--abbrev-ref", "HEAD"]).strip()
+
+# ---------------- misc utils ----------------
+def current_user(case_sensitive=True):
+    name = subprocess.run(["git", "config", "user.name"], stdout=subprocess.PIPE, text=True).stdout.strip()
+    if not name:
+        name = getpass.getuser()
+    return name if case_sensitive else name.lower()
+
+def norm_posix(p: str) -> str:
+    return os.path.normpath(p).replace("\\", "/")
+
+def abspath_under(root: str, rel: str) -> str:
+    return norm_posix(os.path.abspath(os.path.join(root, rel)))
+
+def ensure_dir(path: str):
+    d = os.path.dirname(path)
+    if d and not os.path.isdir(d):
+        os.makedirs(d, exist_ok=True)
+
+def load_policy(root: str):
+    path = os.path.join(root, "config", "hook_policy.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data["_path"] = path
+        return data
+    except FileNotFoundError:
+        ui_err("Policy file not found", f"{path}\nCreate config/hook_policy.json or commit it first.")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        ui_err("Policy JSON invalid", str(e))
+        sys.exit(1)
+
+def to_ext_list(seq):
+    return [(x if x.startswith(".") else "." + x) for x in (seq or [])]
+
+def ext_of(p: str) -> str:
+    return os.path.splitext(p)[1].lower()
+
+def path_match(pattern: str, file_abs: str, root: str, expand_env: bool, abs_when_slash: bool) -> bool:
+    if expand_env:
+        pattern = os.path.expandvars(pattern)
+    if abs_when_slash and pattern.startswith("/"):
+        pat_abs = norm_posix(os.path.abspath(pattern))
+    else:
+        pat_abs = abspath_under(root, pattern)
+    return PurePosixPath(file_abs).match(pat_abs)
+
+def first_matching_entry(entries, file_abs, root, expand_env, abs_when_slash):
+    if not entries:
+        return None
+    for e in entries:
+        if "path" in e and path_match(e["path"], file_abs, root, expand_env, abs_when_slash):
+            return e
+        if "files" in e:
+            for pat in e["files"]:
+                if path_match(pat, file_abs, root, expand_env, abs_when_slash):
+                    return e
+    return None
+
+def staged_name_status():
+    out = run(["git", "diff", "--cached", "--name-status", "-M"])
+    items = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        status = parts[0]
+        if status.startswith("R"):
+            if len(parts) >= 3:
+                items.append({"status": "R", "path": parts[1], "new_path": parts[2]})
+        else:
+            items.append({"status": status, "path": parts[1] if len(parts) > 1 else parts[0], "new_path": None})
+    return items
+
+def parse_date(date_str):
+    if not date_str: return None
+    try:
+        # Accept "YYYY-MM-DD HH:MM:SS" or ISO without timezone.
+        return datetime.fromisoformat(date_str.replace("T", " ").replace("Z", ""))
+    except Exception:
+        try:
+            return datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            try:
+                dt = datetime.strptime(date_str, "%Y-%m-%d")
+                return dt.replace(hour=0, minute=0, second=0)
+            except Exception:
+                return None
+
+# ---------------- Color/UI helpers ----------------
+def supports_color():
+    if os.environ.get("NO_COLOR"): return False
+    if os.environ.get("CLICOLOR_FORCE"): return True
+    return sys.stdout.isatty()
+
+def ui_cfg(opts_ui):
+    color_opt = (opts_ui or {}).get("color", None)
+    color_on = supports_color() if color_opt is None else bool(color_opt)
+    show_hints = bool(int(os.environ.get("DV_HOOK_TIPS", "1"))) and bool((opts_ui or {}).get("show_hints", True))
+    show_admins = bool((opts_ui or {}).get("show_admins", True))
+    show_allowed = bool((opts_ui or {}).get("show_allowed_users", True))
+    max_files = int((opts_ui or {}).get("max_files_per_group", 20))
+    mute = bool(int(os.environ.get("DV_HOOK_MUTE", "0")))
+    show_decisions = bool(int(os.environ.get("DV_HOOK_SHOW_DECISIONS", "0")))
+    return color_on, show_hints, show_admins, show_allowed, max_files, mute, show_decisions
+
+def palette(on):
+    def _c(code): return code if on else ""
+    return {
+        "RST": _c("\033[0m"),
+        "B":   _c("\033[1m"),
+        "DIM": _c("\033[2m"),
+        "RED": _c("\033[31m"),
+        "GRN": _c("\033[32m"),
+        "YEL": _c("\033[33m"),
+        "BLU": _c("\033[34m"),
+        "MAG": _c("\033[35m"),
+        "CYN": _c("\033[36m"),
+    }
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+def strip_ansi(s: str) -> str:
+    return ANSI_RE.sub("", s)
+
+def wc_display_width(s: str) -> int:
+    """
+    Approx terminal cell width: ignores ANSI; combining=0; East Asian wide/emoji ranges=2.
+    """
+    s = strip_ansi(s)
+    w = 0
+    for ch in s:
+        if unicodedata.combining(ch):
+            continue
+        o = ord(ch)
+        ea = unicodedata.east_asian_width(ch)
+        is_wide = (
+            ea in ("W", "F") or
+            (0x2700  <= o <= 0x27BF) or   # Dingbats
+            (0x1F300 <= o <= 0x1FAFF)     # Misc & Supplemental Symbols/Pictographs
+        )
+        w += 2 if is_wide else 1
+    return w
+
+def pad_display(s: str, target_width: int) -> str:
+    cur = wc_display_width(s)
+    if cur >= target_width:
+        return s
+    return s + (" " * (target_width - cur))
+
+def box(title, lines, color, pal):
+    """Unicode box with proper width for emoji/wide chars."""
+    contents = lines or []
+    try:
+        min_inner = max(40, int(os.environ.get("DV_HOOK_BOX_MIN", "56")))
+    except Exception:
+        min_inner = 56
+    inner_width = max(
+        min_inner,
+        wc_display_width(title),
+        *(wc_display_width(l) for l in contents) if contents else [0]
+    )
+    total_width = inner_width + 4
+    top = f"┏{'━' * (total_width - 2)}┓"
+    mid = f"┃ {pad_display(title, inner_width)} ┃"
+    body = [f"┃ {pad_display(l, inner_width)} ┃" for l in contents]
+    bot = f"┗{'━' * (total_width - 2)}┛"
+    return "\n".join([
+        pal[color] + top + pal["RST"],
+        pal[color] + mid + pal["RST"],
+        *body,
+        pal[color] + bot + pal["RST"],
+    ])
+
+def ui_err(title, detail):
+    on = supports_color()
+    pal = palette(on)
+    lines = detail.splitlines() if isinstance(detail, str) else (detail or [])
+    print(box(f"❌ {title}", lines, "RED", pal))
+
+def ui_ok(title, lines=None):
+    on = supports_color()
+    pal = palette(on)
+    print(box(f"✅ {title}", lines or [], "GRN", pal))
+def prune_dvshare(root):
+    base = os.path.join(root, ".git", "dv-share")
+    if not os.path.isdir(base):
+        return
+    now = datetime.now()
+    removed = []
+    for sid in list(os.listdir(base)):
+        mpath = os.path.join(base, sid, "manifest.json")
+        try:
+            with open(mpath, "r", encoding="utf-8") as f:
+                m = json.load(f)
+            exp = m.get("expires_at")
+            if exp and now > datetime.fromisoformat(exp):
+                shutil.rmtree(os.path.join(base, sid), ignore_errors=True)
+                removed.append(sid)
+        except Exception:
+            shutil.rmtree(os.path.join(base, sid), ignore_errors=True)
+            removed.append(sid)
+    # optional: log pruning
+    if removed:
+        ensure_dir(log_abs)
+        with open(log_abs, "a", encoding="utf-8") as f:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"[{ts}] dvshare pruned: {', '.join(removed)}\n")
+
+# ---------------- bypass & ledger ----------------
+def sha256_hex(s: str) -> str:
+    import hashlib
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def load_ledger(root: str):
+    path = os.path.join(root, ".git", "dv-hooks", "bypass_ledger.json")
+    if not os.path.isfile(path): return path, []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return path, json.load(f)
+    except Exception:
+        return path, []
+
+def save_ledger(path: str, entries):
+    ensure_dir(path)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(entries, f, indent=2)
+
+# ---------------- main ----------------
+def main():
+    root = repo_root()
+    pol  = load_policy(root)
+    prune_dvshare(root)
+    
+    opts = pol.get("options", {})
+    opts_ui = opts.get("ui", {}) if isinstance(opts.get("ui", {}), dict) else {}
+    color_on, show_hints, show_admins, show_allowed, max_files_group, mute, show_decisions = ui_cfg(opts_ui)
+    pal = palette(color_on)
+
+    expand_env    = bool(opts.get("expand_env", True))
+    case_sensitive= bool(opts.get("case_sensitive_users", True))
+    abs_when_slash= bool(opts.get("treat_patterns_as_absolute_when_starting_with_slash", True))
+    log_path      = opts.get("log_path", "simlog/precommit_access.log")
+    log_abs       = abspath_under(root, log_path)
+
+    me = current_user(case_sensitive)
+    admins = pol.get("config_admins", [])
+    admins_cmp = admins if case_sensitive else [a.lower() for a in admins]
+
+    # Policy sections
+    locked    = pol.get("locked", []) or []
+    restricted= pol.get("restricted", []) or []
+    del_prot  = pol.get("deletion_protected", []) or []
+    global_bypass_exts = to_ext_list(pol.get("global_bypass", {}).get("allowed_extensions", []))
+
+    # Emergency bypass (general)
+    eb = pol.get("emergency_bypass", {}) or {}
+    eb_enabled       = bool(eb.get("enabled", False))
+    eb_allowed_users = eb.get("allowed_users", []) or []
+    eb_allowed_cmp   = eb_allowed_users if case_sensitive else [u.lower() for u in eb_allowed_users]
+    eb_require_reason= bool(eb.get("require_reason", True))
+    eb_tokens        = eb.get("tokens", []) or []
+
+    # Freeze
+    freeze = pol.get("freeze", {}) or {}
+    freeze_enabled       = bool(freeze.get("enabled", False))
+    freeze_branch        = freeze.get("branch", "main")
+    freeze_windows       = freeze.get("windows", []) or []
+    freeze_allowed_users = freeze.get("allowed_users", []) or []
+    freeze_allowed_cmp   = freeze_allowed_users if case_sensitive else [u.lower() for u in freeze_allowed_users]
+    freeze_require_reason= bool(freeze.get("require_reason", True))
+    freeze_tokens        = freeze.get("tokens", []) or []
+    freeze_priority      = freeze.get("priority", "override_all")
+
+    # Smoke Test Gate config
+    smoke = pol.get("smoke_test", {}) or {}
+    smoke_enabled   = bool(smoke.get("enabled", False))
+    smoke_mode      = str(smoke.get("mode", "warn")).lower()     # "warn" | "block"
+    smoke_timeout   = int(smoke.get("timeout_sec", 1200))
+    smoke_shell     = smoke.get("shell", "csh")                  # "csh" | "sh"
+    smoke_setup_csh = smoke.get("setup_csh")
+    smoke_paths     = smoke.get("paths_compile_elab", ["tb/**"])
+    smoke_cmds_ce   = smoke.get("cmds_compile_elab", [["cdtc","cpuss__sanity"], ["runTest","-do","compile"], ["runTest","-do","elab"]])
+    smoke_hdr_globs = smoke.get("sw_header_globs", ["sw/**/*.h", "sw/**/*.hpp", "sw/**/*.hh"])
+    smoke_cmds_sw   = smoke.get("cmds_sw", [["cdtc","cpuss__Sanity"], ["runTest","-do","sw"]])
+
+    def file_is_frozen(abs_path: str) -> bool:
+        if not freeze_enabled: return False
+        if branch_name() != freeze_branch: return False
+        now = datetime.now()
+        active = False
+        if not freeze_windows:
+            active = True
+        else:
+            for w in freeze_windows:
+                start = parse_date(w.get("from")); end = parse_date(w.get("to"))
+                if (start is None or now >= start) and (end is None or now <= end):
+                    pats = w.get("paths") or ["**"]
+                    for pat in pats:
+                        if path_match(pat, abs_path, root, expand_env, abs_when_slash):
+                            active = True
+                            break
+                if active: break
+        return active
+
+    # Gather staged changes
+    changes = staged_name_status()
+    violations = []
+    decisions  = []
+
+    # Protect policy file (never bypassable)
+    policy_rel = norm_posix(os.path.relpath(pol["_path"], root))
+    if any(norm_posix(ch["path"]) == policy_rel or (ch["new_path"] and norm_posix(ch["new_path"]) == policy_rel)
+           for ch in changes):
+        if me not in admins_cmp:
+            details = [
+                f"User: {me}",
+                f"Only config_admins may modify {policy_rel}",
+                f"Admins: {', '.join(admins) or '(none listed)'}",
+            ]
+            ui_err("Policy protected", "\n".join(details))
+            sys.exit(1)
+
+    # Evaluate changes
+    for ch in changes:
+        status = ch["status"]
+        rel    = norm_posix(ch["path"])
+        new_rel = norm_posix(ch["new_path"]) if ch["new_path"] else None
+        f_abs  = abspath_under(root, rel)
+        new_abs= abspath_under(root, new_rel) if new_rel else None
+        ext    = ext_of(rel)
+
+        # Freeze first (if highest priority)
+        if freeze_priority == "override_all" and file_is_frozen(f_abs):
+            violations.append(("freeze", rel))
+            decisions.append(f"BLOCK (freeze active): {rel}")
+            # for renames we still need to process new path after recording the block on old path
+            if status != "R":
+                continue
+
+        # Deletion protection (old path)
+        if status in ("D", "R"):
+            if any(path_match(pat, f_abs, root, expand_env, abs_when_slash) for pat in del_prot):
+                violations.append(("admin_delete", rel))
+                decisions.append(f"BLOCK (admin-only delete): {rel}")
+            if status == "R" and new_abs:
+                # Switch context to new path for subsequent checks
+                rel, f_abs, ext = new_rel, new_abs, ext_of(new_rel)
+
+        # Global extension bypass (only for non-deletes)
+        if status not in ("D", "R") and ext in global_bypass_exts:
+            decisions.append(f"ALLOW (global ext): {rel}")
+            continue
+
+        # Locked
+        le = first_matching_entry(locked, f_abs, root, expand_env, abs_when_slash)
+        if le:
+            allowed_exts = to_ext_list(le.get("allowed_extensions", []))
+            if ext in allowed_exts:
+                decisions.append(f"ALLOW (locked-entry ext): {rel}")
+            else:
+                violations.append(("locked", rel))
+                decisions.append(f"BLOCK (locked): {rel}")
+            continue
+
+        # Restricted
+        re_ = first_matching_entry(restricted, f_abs, root, expand_env, abs_when_slash)
+        if re_:
+            allowed_exts = to_ext_list(re_.get("allowed_extensions", []))
+            if ext in allowed_exts:
+                decisions.append(f"ALLOW (restricted-entry ext): {rel}")
+            else:
+                allowed_users = re_.get("allowed_users", []) or []
+                allowed_cmp = allowed_users if case_sensitive else [u.lower() for u in allowed_users]
+                if me in allowed_cmp:
+                    decisions.append(f"ALLOW (restricted user): {rel}")
+                else:
+                    violations.append(("restricted", rel))
+                    decisions.append(f"BLOCK (restricted user): {rel}")
+            continue
+
+        decisions.append(f"ALLOW (default): {rel}")
+
+    # Freeze bypass (removes only freeze violations)
+    def try_freeze_bypass():
+        if not (freeze_enabled and any(k == "freeze" for k, _ in violations)):
+            return False, None
+        token = os.environ.get("DV_HOOK_BYPASS")
+        reason = os.environ.get("DV_HOOK_BYPASS_REASON", "").strip()
+        if not token: return False, None
+        if me not in freeze_allowed_cmp:
+            return False, "Freeze bypass denied: user not permitted."
+        if freeze_require_reason and not reason:
+            return False, "Freeze bypass denied: DV_HOOK_BYPASS_REASON required."
+        token_hash = sha256_hex(token)
+        candidate = None
+        for t in freeze_tokens:
+            if str(t.get("sha256", "")).lower() == token_hash:
+                candidate = t; break
+        if not candidate:
+            return False, "Freeze bypass denied: token not recognized."
+        exp = parse_date(candidate.get("expires"))
+        if exp and datetime.now() > exp:
+            return False, "Freeze bypass denied: token expired."
+        ledger_path, ledger = load_ledger(root)
+        if not bool(candidate.get("reusable", False)):
+            if any(e.get("token_sha256") == token_hash for e in ledger):
+                return False, "Freeze bypass denied: one-time token already used."
+        ledger.append({
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "user": me, "token_sha256": token_hash,
+            "label": candidate.get("label"),
+            "reason": reason,
+            "violations": [f for k,f in violations if k == "freeze"]
+        })
+        save_ledger(ledger_path, ledger)
+        for i, d in enumerate(decisions):
+            if d.startswith("BLOCK (freeze active):"):
+                decisions[i] = "BYPASS-ALLOW (freeze):" + d[len("BLOCK (freeze active):"):]
+        violations[:] = [(k,f) for k,f in violations if k != "freeze"]
+        return True, None
+
+    bypassed_freeze, err = try_freeze_bypass()
+    if err:
+        ui_err("Freeze bypass denied", err)
+        sys.exit(1)
+
+    # Emergency bypass (removes any remaining violations)
+    def try_emergency_bypass():
+        if not (eb_enabled and violations):
+            return False, None
+        token = os.environ.get("DV_HOOK_BYPASS")
+        reason = os.environ.get("DV_HOOK_BYPASS_REASON", "").strip()
+        if not token:
+            return False, None
+        if me not in eb_allowed_cmp:
+            return False, "Bypass denied: user not permitted."
+        if eb_require_reason and not reason:
+            return False, "Bypass denied: DV_HOOK_BYPASS_REASON required."
+        token_hash = sha256_hex(token)
+        candidate = None
+        for t in eb_tokens:
+            if str(t.get("sha256", "")).lower() == token_hash:
+                candidate = t; break
+        if not candidate:
+            return False, "Bypass denied: token not recognized."
+        exp = parse_date(candidate.get("expires"))
+        if exp and datetime.now() > exp:
+            return False, "Bypass denied: token expired."
+        ledger_path, ledger = load_ledger(root)
+        if not bool(candidate.get("reusable", False)):
+            if any(e.get("token_sha256") == token_hash for e in ledger):
+                return False, "Bypass denied: one-time token already used."
+        ledger.append({
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "user": me, "token_sha256": token_hash,
+            "label": candidate.get("label"),
+            "reason": reason,
+            "violations": [f for _,f in violations]
+        })
+        save_ledger(ledger_path, ledger)
+        for i, d in enumerate(decisions):
+            if d.startswith("BLOCK "):
+                decisions[i] = "BYPASS-ALLOW " + d[6:]
+        violations.clear()
+        return True, None
+
+    bypassed_emerg, err2 = try_emergency_bypass()
+    if err2:
+        ui_err("Bypass denied", err2)
+        sys.exit(1)
+
+    # Audit decisions to log
+    ensure_dir(log_abs)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(log_abs, "a", encoding="utf-8") as f:
+        for d in decisions:
+            f.write(f"[{ts}] {me}: {d}\n")
+
+    if os.environ.get("DV_HOOK_SHOW_DECISIONS") == "1" and decisions:
+        print("\n".join([f"{pal['DIM']}{d}{pal['RST']}" for d in decisions]))
+
+    # --- Smoke Test Gate (runs only if policy passed so far) ---
+    # Configured via "smoke_test" in policy.
+    def triggered_compile_elab():
+        for ch in changes:
+            rel = norm_posix(ch["new_path"] or ch["path"])
+            abs_p = abspath_under(root, rel)
+            ext = ext_of(rel)
+            if ext in global_bypass_exts:
+                continue
+            for pat in smoke_paths:
+                if path_match(pat, abs_p, root, expand_env, abs_when_slash):
+                    return True
+        return False
+
+    def triggered_sw_headers():
+        for ch in changes:
+            if ch["status"] not in ("A", "M", "R"):
+                continue
+            rel = norm_posix(ch["new_path"] or ch["path"])
+            abs_p = abspath_under(root, rel)
+            ext = ext_of(rel)
+            if ext not in (".h", ".hpp", ".hh"):
+                continue
+            for pat in (smoke_hdr_globs or ["sw/**"]):
+                if path_match(pat, abs_p, root, expand_env, abs_when_slash):
+                    return True
+        return False
+
+    def run_command_sequence(seq_list, title, smoke_log_abs):
+        ensure_dir(smoke_log_abs)
+        start = datetime.now()
+        with open(smoke_log_abs, "a", encoding="utf-8") as log:
+            log.write(f"\n=== {start.isoformat(timespec='seconds')} :: {title} ===\n")
+
+        if smoke_shell == "csh" and smoke_setup_csh:
+            joined = " && ".join(" ".join(map(str, cmd)) for cmd in seq_list)
+            cmd = ["csh", "-fc", f"source {smoke_setup_csh}; {joined}"]
+            try:
+                proc = subprocess.run(cmd, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                      text=True, timeout=smoke_timeout)
+                out, rc = proc.stdout, proc.returncode
+            except subprocess.TimeoutExpired:
+                out, rc = f"<TIMEOUT {smoke_timeout}s while running: {' '.join(cmd)}>\n", 124
+        else:
+            rc, out_chunks = 0, []
+            for sub in seq_list:
+                try:
+                    p = subprocess.run(sub, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       text=True, timeout=smoke_timeout)
+                    out_chunks.append(f"$ {' '.join(map(str,sub))}\n{p.stdout}")
+                    if p.returncode != 0:
+                        rc = p.returncode
+                        break
+                except subprocess.TimeoutExpired:
+                    out_chunks.append(f"$ {' '.join(map(str,sub))}\n<TIMEOUT after {smoke_timeout}s>\n")
+                    rc = 124
+                    break
+            out = "\n".join(out_chunks)
+
+        with open(smoke_log_abs, "a", encoding="utf-8") as log:
+            log.write(out + "\n")
+            log.write(f"=== rc={rc} ===\n")
+        return rc
+
+    if smoke_enabled and not violations:
+        plans = []
+        if triggered_compile_elab():
+            plans.append(("Compile+Elab", smoke_cmds_ce))
+        if triggered_sw_headers():
+            plans.append(("SW headers", smoke_cmds_sw))
+
+        if plans:
+            smoke_log_abs = abspath_under(root, log_path.replace("precommit_access.log", "smoke.log"))
+            ctx = [
+                f"{pal['B']}Reason(s){pal['RST']}: " + ", ".join([n for n,_ in plans]),
+                f"{pal['B']}Log{pal['RST']}: {norm_posix(os.path.relpath(smoke_log_abs, root))}"
+            ]
+            print(box("🔎 Running smoke checks", ctx, "BLU", pal))
+
+            failures = []
+            for name, seq in plans:
+                rc = run_command_sequence(seq, name, smoke_log_abs)
+                if rc != 0:
+                    failures.append((name, rc))
+
+            if failures:
+                if smoke_mode == "block":
+                    lines = [f"{pal['B']}Failed check(s){pal['RST']}:"]
+                    lines += [f"  • {n} (rc={rc})" for n,rc in failures]
+                    lines.append(f"{pal['B']}See log{pal['RST']}: {norm_posix(os.path.relpath(smoke_log_abs, root))}")
+                    ui_err("Smoke checks failed", "\n".join(lines))
+                    sys.exit(1)
+                else:
+                    lines = [f"{pal['YEL']}Some smoke checks failed (commit allowed){pal['RST']}:"]
+                    lines += [f"  • {n} (rc={rc})" for n,rc in failures]
+                    lines.append(f"{pal['B']}See log{pal['RST']}: {norm_posix(os.path.relpath(smoke_log_abs, root))}")
+                    print("\n".join(lines))
+            else:
+                print(box("✅ Smoke checks passed", [], "GRN", pal))
+
+    # Verdict
+    if violations:
+        groups = {"freeze": [], "admin_delete": [], "locked": [], "restricted": []}
+        for k, f in violations: groups.setdefault(k, []).append(f)
+        lines = []
+        lines.append(f"{pal['B']}User:{pal['RST']} {me}")
+        if show_admins:
+            lines.append(f"{pal['B']}Config admins:{pal['RST']} {', '.join(admins) or '(none)'}")
+        lines.append(f"{pal['B']}Branch:{pal['RST']} {branch_name()}")
+        lines.append(f"{pal['B']}Policy:{pal['RST']} {norm_posix(os.path.relpath(pol['_path'], root))}")
+        lines.append(f"{pal['B']}Log:{pal['RST']} {norm_posix(os.path.relpath(log_abs, root))}")
+        lines.append("")
+
+        def add_group(title, emoji, key):
+            files = groups.get(key) or []
+            if not files: return
+            count = len(files)
+            lines.append(f"{emoji} {pal['B']}{title}{pal['RST']} ({count})")
+            shown = files[:max_files_group]
+            for p in shown:
+                reason = ""
+                if key == "locked": reason = " — path matches a locked rule"
+                elif key == "restricted":
+                    entry = first_matching_entry(restricted, abspath_under(root, p), root, expand_env, abs_when_slash)
+                    allow = (entry or {}).get("allowed_users", [])
+                    if allow and show_allowed:
+                        reason = f" — only allowed users: {', '.join(allow)}"
+                    else:
+                        reason = " — user not allowed"
+                elif key == "admin_delete": reason = " — deletes/renames in admin-only area"
+                elif key == "freeze": reason = " — freeze window active"
+                lines.append(f"  • {p}{reason}")
+            if count > max_files_group:
+                lines.append(f"  … and {count - max_files_group} more")
+            lines.append("")
+
+        add_group("Locked paths", "🔒", "locked")
+        add_group("Restricted paths (user not allowed)", "👤", "restricted")
+        add_group("Admin-only deletions/renames", "🛑", "admin_delete")
+        add_group("Freeze active", "🧊", "freeze")
+
+        if show_hints and not os.environ.get("DV_HOOK_MUTE"):
+            lines.append(f"{pal['B']}What you can do now{pal['RST']}:")
+            lines.append("  • Review staged files: git diff --cached --name-only")
+            lines.append("  • Unstage a file:      git restore --staged <path>")
+            lines.append("  • Commit allowed parts: git commit -m \"...\" (after unstaging blocked files)")
+            if eb_enabled and me in eb_allowed_cmp:
+                lines.append("  • If policy allows, you may bypass (audited):")
+                lines.append("      DV_HOOK_BYPASS=\"<token>\" DV_HOOK_BYPASS_REASON=\"<why>\" git commit -m \"...\"")
+            if freeze_enabled and me in freeze_allowed_cmp and groups.get("freeze"):
+                lines.append("  • Freeze bypass is separate; use a valid freeze token (audited).")
+            lines.append("")
+        ui_err("Pre-commit blocked by policy", "\n".join(lines))
+        sys.exit(1)
+
+    if not mute:
+        ui_ok("Pre-commit policy check passed")
+    sys.exit(0)
+
+if __name__ == "__main__":
+    main()
