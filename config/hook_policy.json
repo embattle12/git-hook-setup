@@ -6,7 +6,13 @@
     "case_sensitive_users": true,
     "expand_env": true,
     "treat_patterns_as_absolute_when_starting_with_slash": true,
-    "log_path": "simlog/precommit_access.log"
+    "log_path": "/c/Users/ajink/Desktop/Git_prune_dvshare(root, log_abs)development/git-hook-setup/simlog/precommit_access.log",
+  "ui": {
+    "color": true,              
+    "show_hints": true,         
+    "show_admins": false,        
+    "show_allowed_users": true, 
+    "max_files_per_group": 20
   },
 
   "global_bypass": { "allowed_extensions": [".md", ".txt", ".csv"] },
@@ -44,5 +50,25 @@
       }
     ],
     "priority": "override_all"           
-  }
+  },
+  
+  "smoke_test": {
+  "enabled": true,
+  "mode": "warn",                          
+  "timeout_sec": 1200,                      
+  "shell": "csh",                           
+  "setup_csh": "setup.csh",                 
+  "paths_compile_elab": ["tb/**", "sim/**", "tb/agents/**", "tb/env/**"],
+  "cmds_compile_elab": [
+    ["cdtc", "cpuss__sanity"],
+    ["runTest", "-do", "compile"],
+    ["runTest", "-do", "elab"]
+  ],
+  "sw_header_globs": ["sw/**/*.h", "sw/**/*.hpp", "sw/**/*.hh"],
+  "cmds_sw": [
+    ["cdtc", "cpuss__Sanity"],
+    ["runTest", "-do", "sw"]
+  ]
+ }
+ }
 }
