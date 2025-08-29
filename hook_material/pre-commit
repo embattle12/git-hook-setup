@@ -221,16 +221,17 @@ def ui_ok(title, lines=None):
     on = supports_color()
     pal = palette(on)
     print(box(f"✅ {title}", lines or [], "GRN", pal))
-def prune_dvshare(root):
+
+def prune_dvshare(root, log_abs=None):
     base = os.path.join(root, ".git", "dv-share")
     if not os.path.isdir(base):
         return
     now = datetime.now()
     removed = []
     for sid in list(os.listdir(base)):
-        mpath = os.path.join(base, sid, "manifest.json")
+        man = os.path.join(base, sid, "manifest.json")
         try:
-            with open(mpath, "r", encoding="utf-8") as f:
+            with open(man, "r", encoding="utf-8") as f:
                 m = json.load(f)
             exp = m.get("expires_at")
             if exp and now > datetime.fromisoformat(exp):
@@ -239,11 +240,11 @@ def prune_dvshare(root):
         except Exception:
             shutil.rmtree(os.path.join(base, sid), ignore_errors=True)
             removed.append(sid)
-    # optional: log pruning
-    if removed:
-        ensure_dir(log_abs)
+    # Optional logging if a log file path is provided
+    if removed and log_abs:
+        ensure_dir(log_abs)  # creates parent dir of the log file
+        ts = now.strftime("%Y-%m-%d %H:%M:%S")
         with open(log_abs, "a", encoding="utf-8") as f:
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             f.write(f"[{ts}] dvshare pruned: {', '.join(removed)}\n")
 
 # ---------------- bypass & ledger ----------------
@@ -269,7 +270,7 @@ def save_ledger(path: str, entries):
 def main():
     root = repo_root()
     pol  = load_policy(root)
-    prune_dvshare(root)
+    
     
     opts = pol.get("options", {})
     opts_ui = opts.get("ui", {}) if isinstance(opts.get("ui", {}), dict) else {}
@@ -281,7 +282,9 @@ def main():
     abs_when_slash= bool(opts.get("treat_patterns_as_absolute_when_starting_with_slash", True))
     log_path      = opts.get("log_path", "simlog/precommit_access.log")
     log_abs       = abspath_under(root, log_path)
-
+    
+    prune_dvshare(root, log_abs)
+    
     me = current_user(case_sensitive)
     admins = pol.get("config_admins", [])
     admins_cmp = admins if case_sensitive else [a.lower() for a in admins]
