@@ -1,0 +1,865 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+DV Pre-commit Access Policy Hook — modular, readable, production-ready.
+
+Features
+- Locked & restricted paths with per-path extension exceptions
+- Global extension bypass (.md/.txt/.csv etc)
+- Admin-only deletes/renames in protected paths
+- Admin-only edits to config/hook_policy.json (never bypassable)
+- Freeze windows (toggle or dated) with separate bypass tokens
+- Emergency bypass (one-time/reusable) with ledger & expiry
+- Smoke Test Gate: TB compile+elab; SW header step (warn|block)
+- Pretty, emoji-safe colored output; helpful hints
+- dvshare auto-prune
+
+Env toggles
+- NO_COLOR=1                 -> disable color
+- DV_HOOK_MUTE=1             -> minimal output
+- DV_HOOK_TIPS=0             -> hide hints
+- DV_HOOK_SHOW_DECISIONS=1   -> print per-file decisions (debug)
+- DV_HOOK_BOX_MIN=72         -> min inner width for boxes (optional)
+- DV_HOOK_DEBUG=1            -> debug dump of context/matches/decisions to stderr
+"""
+
+import os, sys, json, getpass, subprocess, re, unicodedata, hashlib, shutil
+from datetime import datetime
+
+# -------------------- Python 3.6+ compatibility for subprocess --------------------
+PY37_PLUS = sys.version_info >= (3, 7)
+SUBPROC_TEXT_KW = {"text": True} if PY37_PLUS else {"universal_newlines": True}
+
+# ================================== UTILITIES ==================================
+
+def run(cmd, cwd=None, check=True):
+    """Run a subprocess and return stdout (str)."""
+    p = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, check=check, **SUBPROC_TEXT_KW)
+    return p.stdout
+
+def repo_root():
+    """Absolute path of the current Git repository root."""
+    return run(["git", "rev-parse", "--show-toplevel"]).strip()
+
+def branch_name():
+    """Current Git branch name."""
+    return run(["git", "rev-parse", "--abbrev-ref", "HEAD"]).strip()
+
+def current_user(case_sensitive=True):
+    """Git user.name (or OS user) honoring case sensitivity policy."""
+    name = subprocess.run(["git", "config", "user.name"],
+                          stdout=subprocess.PIPE, **SUBPROC_TEXT_KW).stdout.strip()
+    if not name:
+        name = getpass.getuser()
+    return name if case_sensitive else name.lower()
+
+def norm_posix(p):
+    """Normalize a path and convert to POSIX-style separators."""
+    return os.path.normpath(p).replace("\\", "/")
+
+def abspath_under(root, rel):
+    """Repo-absolute real path from a repo-relative path."""
+    return norm_posix(os.path.realpath(os.path.join(root, rel)))
+
+def ensure_dir(file_path):
+    """Ensure parent directory for the given file path exists."""
+    d = os.path.dirname(file_path)
+    if d and not os.path.isdir(d):
+        os.makedirs(d, exist_ok=True)
+
+def to_ext_list(seq):
+    """Normalize extensions to dot-prefixed lowercase list."""
+    return [x if x.startswith(".") else "." + x for x in (seq or [])]
+
+def ext_of(p):
+    """File extension in lowercase, including the dot."""
+    return os.path.splitext(p)[1].lower()
+
+def parse_date(date_str):
+    """Parse 'YYYY-MM-DD HH:MM:SS' or 'YYYY-MM-DD' into datetime (local)."""
+    if not date_str:
+        return None
+    try:
+        return datetime.fromisoformat(date_str.replace("T", " ").replace("Z", ""))
+    except Exception:
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(date_str, fmt)
+                if fmt == "%Y-%m-%d":
+                    dt = dt.replace(hour=0, minute=0, second=0)
+                return dt
+            except Exception:
+                pass
+    return None
+
+# ================================== UI HELPERS ==================================
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+def supports_color():
+    """Whether the terminal likely supports ANSI colors."""
+    if os.environ.get("NO_COLOR"): return False
+    if os.environ.get("CLICOLOR_FORCE"): return True
+    return sys.stdout.isatty()
+
+def strip_ansi(s): return ANSI_RE.sub("", s)
+
+def wc_display_width(s):
+    """Visible width accounting for emoji/CJK 2-column glyphs."""
+    s = strip_ansi(s)
+    w = 0
+    for ch in s:
+        if unicodedata.combining(ch): continue
+        o = ord(ch)
+        ea = unicodedata.east_asian_width(ch)
+        wide = (ea in ("W","F")) or (0x2700 <= o <= 0x27BF) or (0x1F300 <= o <= 0x1FAFF)
+        w += 2 if wide else 1
+    return w
+
+def pad_display(s, width):
+    """Pad a string to a desired display width."""
+    cur = wc_display_width(s)
+    return s if cur >= width else s + (" " * (width - cur))
+
+def palette(on):
+    """Color palette (noop strings when color is off)."""
+    def _c(code): return code if on else ""
+    return {"RST":_c("\033[0m"), "B":_c("\033[1m"), "DIM":_c("\033[2m"),
+            "RED":_c("\033[31m"), "GRN":_c("\033[32m"), "YEL":_c("\033[33m"),
+            "BLU":_c("\033[34m"), "MAG":_c("\033[35m"), "CYN":_c("\033[36m")}
+
+def box(title, lines, color, pal):
+    """Render a colored information box with emoji-safe width."""
+    contents = lines or []
+    try:
+        min_inner = max(40, int(os.environ.get("DV_HOOK_BOX_MIN", "56")))
+    except Exception:
+        min_inner = 56
+    inner = max(min_inner, wc_display_width(title), *(wc_display_width(l) for l in contents) if contents else [0])
+    top = f"┏{'━' * (inner + 2)}┓"
+    mid = f"┃ {pad_display(title, inner)} ┃"
+    body = [f"┃ {pad_display(l, inner)} ┃" for l in contents]
+    bot = f"┗{'━' * (inner + 2)}┛"
+    return "\n".join([pal[color]+top+pal["RST"], pal[color]+mid+pal["RST"], *body, pal[color]+bot+pal["RST"]])
+
+def ui_err(title, detail):
+    """Print a red error box with a title and multi-line details."""
+    pal = palette(supports_color())
+    lines = detail.splitlines() if isinstance(detail, str) else (detail or [])
+    print(box(f"❌ {title}", lines, "RED", pal))
+
+def ui_ok(title, lines=None):
+    """Print a green success box with optional details."""
+    pal = palette(supports_color())
+    print(box(f"✅ {title}", lines or [], "GRN", pal))
+
+def load_ui_config(opts_ui):
+    """Compute UI config and palette from policy options and env toggles."""
+    color_opt = (opts_ui or {}).get("color", None)
+    color_on = supports_color() if color_opt is None else bool(color_opt)
+    show_hints = bool(int(os.environ.get("DV_HOOK_TIPS", "1"))) and bool((opts_ui or {}).get("show_hints", True))
+    show_admins = bool((opts_ui or {}).get("show_admins", True))
+    show_allowed = bool((opts_ui or {}).get("show_allowed_users", True))
+    max_files = int((opts_ui or {}).get("max_files_per_group", 20))
+    mute = bool(int(os.environ.get("DV_HOOK_MUTE", "0")))
+    show_decisions = bool(int(os.environ.get("DV_HOOK_SHOW_DECISIONS", "0")))
+    return color_on, show_hints, show_admins, show_allowed, max_files, mute, show_decisions, palette(color_on)
+
+# =============================== POLICY / MATCH ===============================
+
+def load_policy(repo):
+    """Load the policy file `config/hook_policy.json` (exit with helpful error if missing/invalid)."""
+    path = os.path.join(repo, "config", "hook_policy.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data["_path"] = path
+        return data
+    except FileNotFoundError:
+        ui_err("Policy file not found", f"{path}\nCreate config/hook_policy.json or commit it first.")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        ui_err("Policy JSON invalid", str(e))
+        sys.exit(1)
+
+def staged_name_status():
+    """Return the list of staged changes with Git status (A/M/D/R)."""
+    out = run(["git", "diff", "--cached", "--name-status", "-M"])
+    items = []
+    for line in out.splitlines():
+        if not line.strip(): continue
+        parts = line.split("\t")
+        status = parts[0]
+        if status.startswith("R") and len(parts) >= 3:
+            items.append({"status": "R", "path": parts[1], "new_path": parts[2]})
+        else:
+            items.append({"status": status, "path": parts[1] if len(parts) > 1 else parts[0], "new_path": None})
+    return items
+
+_GLOB_RE_CACHE = {}
+def glob_to_regex(pat):
+    """Convert a glob (supports **, *, ?) to a compiled regex anchored to full path."""
+    rx = _GLOB_RE_CACHE.get(pat)
+    if rx: return rx
+    import re as _re
+    P = pat.replace("\\", "/")
+    parts = P.split("**")
+    out = []
+    for i, part in enumerate(parts):
+        part = _re.escape(part).replace(r"\*", "[^/]*").replace(r"\?", "[^/]")
+        out.append(part)
+        if i != len(parts) - 1:
+            out.append(".*")  # '**' crosses directories
+    rx = _re.compile("^" + "".join(out) + "$")
+    _GLOB_RE_CACHE[pat] = rx
+    return rx
+
+def expand_policy_pattern(pat, repo, expand_env):
+    """
+    Expand policy variables with deterministic semantics:
+    - Always substitute $RF_TOP and ${RF_TOP} with the repo root (POSIX-normalized).
+    - Optionally expand remaining environment variables if expand_env is True.
+    """
+    if not pat:
+        return pat
+    rf = norm_posix(repo)
+    pat2 = pat.replace("${RF_TOP}", rf).replace("$RF_TOP", rf)
+    return os.path.expandvars(pat2) if expand_env else pat2
+def path_match(pattern, file_abs, repo, expand_env, abs_when_slash):
+    if not pattern:
+        return False
+    pat = expand_policy_pattern(pattern, repo, expand_env)
+    pat = norm_posix(pat)
+
+    if os.path.isabs(pat):
+        pat_abs = pat
+    elif abs_when_slash and pat.startswith("/"):
+        pat_abs = norm_posix(os.path.abspath(pat))
+    else:
+        pat_abs = abspath_under(repo, pat)
+
+    file_abs_norm = norm_posix(os.path.realpath(file_abs))
+
+    # 🔧 optional case-fold on Windows if requested
+    win_ci = (os.name == "nt") and bool((load_policy(repo).get("options", {}) or {}).get("windows_case_insensitive_paths", True))
+    if win_ci:
+        pat_abs_cmp = pat_abs.lower()
+        file_abs_cmp = file_abs_norm.lower()
+    else:
+        pat_abs_cmp = pat_abs
+        file_abs_cmp = file_abs_norm
+
+    rx = glob_to_regex(pat_abs_cmp)
+    matched = bool(rx.match(file_abs_cmp))
+
+    if os.environ.get("DV_HOOK_DEBUG") == "1":
+        sys.stderr.write(f"[MATCH] pat={pat_abs_cmp} file={file_abs_cmp} -> {matched}\n")
+    return matched
+
+def first_matching_entry(entries, file_abs, repo, expand_env, abs_when_slash):
+    """Return the first policy entry in `entries` whose path/files globs match `file_abs`."""
+    if not entries: return None
+    for e in entries:
+        if "path" in e and path_match(e["path"], file_abs, repo, expand_env, abs_when_slash):
+            return e
+        if "files" in e:
+            for pat in e["files"]:
+                if path_match(pat, file_abs, repo, expand_env, abs_when_slash):
+                    return e
+    return None
+
+# ============================== BYPASS / LEDGER ==============================
+
+def sha256_hex(s): return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def load_ledger(repo):
+    """Load the bypass ledger JSON (.git/dv-hooks/bypass_ledger.json)."""
+    path = os.path.join(repo, ".git", "dv-hooks", "bypass_ledger.json")
+    if not os.path.isfile(path): return path, []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return path, json.load(f)
+    except Exception:
+        return path, []
+
+def save_ledger(path, entries):
+    """Persist the bypass ledger JSON."""
+    ensure_dir(path)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(entries, f, indent=2)
+
+# ================================ DVSHARE =================================
+
+def prune_dvshare(repo, log_abs=None):
+    """Remove expired dvshare sandboxes under .git/dv-share/* and optionally log what was pruned."""
+    base = os.path.join(repo, ".git", "dv-share")
+    if not os.path.isdir(base): return
+    now = datetime.now()
+    removed = []
+    for sid in list(os.listdir(base)):
+        mpath = os.path.join(base, sid, "manifest.json")
+        try:
+            with open(mpath, "r", encoding="utf-8") as f:
+                m = json.load(f)
+            exp = m.get("expires_at")
+            if exp and now > datetime.fromisoformat(exp):
+                shutil.rmtree(os.path.join(base, sid), ignore_errors=True)
+                removed.append(sid)
+        except Exception:
+            shutil.rmtree(os.path.join(base, sid), ignore_errors=True)
+            removed.append(sid)
+    if removed and log_abs:
+        ensure_dir(log_abs)
+        ts = now.strftime("%Y-%m-%d %H:%M:%S")
+        with open(log_abs, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] dvshare pruned: {', '.join(removed)}\n")
+
+# ============================== POLICY EVALUATION ==============================
+
+def protect_policy_file(changes, *, repo, policy_path, admins, case_sensitive):
+    """Block if a non-admin attempts to modify the policy file (never bypassable)."""
+    rel_policy = norm_posix(os.path.relpath(policy_path, repo))
+    me = current_user(case_sensitive)
+    admins_cmp = admins if case_sensitive else [a.lower() for a in admins]
+    for ch in changes:
+        old_rel = norm_posix(ch["path"]); new_rel = norm_posix(ch["new_path"] or "")
+        if old_rel == rel_policy or new_rel == rel_policy:
+            if me not in admins_cmp:
+                return False, f"User: {me}\nOnly config_admins may modify {rel_policy}\nAdmins: {', '.join(admins) or '(none listed)'}"
+    return True, None
+
+def freeze_active_for_file(abs_path, *, repo, freeze_cfg, expand_env, abs_when_slash, cur_branch):
+    """Whether freeze is enabled, on the target branch, and this path matches an active window/pattern."""
+    if not freeze_cfg.get("enabled", False): return False
+    if cur_branch != freeze_cfg.get("branch", "main"): return False
+    now = datetime.now()
+    windows = freeze_cfg.get("windows") or [{"paths": ["**"]}]
+    for w in windows:
+        start = parse_date(w.get("from")); end = parse_date(w.get("to"))
+        if (start is None or now >= start) and (end is None or now <= end):
+            for pat in (w.get("paths") or ["**"]):
+                if path_match(pat, abs_path, repo, expand_env, abs_when_slash):
+                    return True
+    return False
+
+def evaluate_changes(changes, *, repo, policy, expand_env, case_sensitive, abs_when_slash):
+    """Evaluate each staged change and return (decisions, violations)."""
+    decisions, violations = [], []
+    locked = policy.get("locked", []) or []
+    restricted = policy.get("restricted", []) or []
+    del_prot = policy.get("deletion_protected", []) or []
+    global_bypass_exts = to_ext_list(policy.get("global_bypass", {}).get("allowed_extensions", []))
+    freeze_cfg = policy.get("freeze", {}) or {}
+    cur_branch = branch_name()
+    me = current_user(case_sensitive)
+
+    for ch in changes:
+        status = ch["status"]
+        rel = norm_posix(ch["path"])
+        new_rel = norm_posix(ch["new_path"]) if ch["new_path"] else None
+        abs_old = abspath_under(repo, rel)
+        abs_new = abspath_under(repo, new_rel) if new_rel else None
+        ext = ext_of(rel)
+
+        # Freeze (override_all)
+        if freeze_cfg.get("priority", "override_all") == "override_all" and \
+           freeze_active_for_file(abs_old, repo=repo, freeze_cfg=freeze_cfg,
+                                  expand_env=expand_env, abs_when_slash=abs_when_slash,
+                                  cur_branch=cur_branch):
+            violations.append(("freeze", rel))
+            decisions.append(f"BLOCK (freeze active): {rel}")
+            if status != "R":
+                continue
+
+        # Deletion protection (old path)
+        if status in ("D", "R"):
+            if any(path_match(pat, abs_old, repo, expand_env, abs_when_slash) for pat in del_prot):
+                violations.append(("admin_delete", rel))
+                decisions.append(f"BLOCK (admin-only delete): {rel}")
+            if status == "R" and abs_new:
+                rel, abs_old, ext = new_rel, abs_new, ext_of(new_rel)
+
+        # Global extension bypass for non-deletes
+        if status not in ("D", "R") and ext in global_bypass_exts:
+            decisions.append(f"ALLOW (global ext): {rel}")
+            continue
+
+        # Locked entries
+        le = first_matching_entry(locked, abs_old, repo, expand_env, abs_when_slash)
+        if le:
+            allowed_exts = to_ext_list(le.get("allowed_extensions", []))
+            if ext in allowed_exts:
+                decisions.append(f"ALLOW (locked-entry ext): {rel}")
+            else:
+                violations.append(("locked", rel))
+                decisions.append(f"BLOCK (locked): {rel}")
+            continue
+
+        # Restricted entries
+        re_ = first_matching_entry(restricted, abs_old, repo, expand_env, abs_when_slash)
+        if re_:
+            allowed_exts = to_ext_list(re_.get("allowed_extensions", []))
+            if ext in allowed_exts:
+                decisions.append(f"ALLOW (restricted-entry ext): {rel}")
+            else:
+                allowed_users = re_.get("allowed_users", []) or []
+                allowed_cmp = allowed_users if case_sensitive else [u.lower() for u in allowed_users]
+                if me in allowed_cmp:
+                    decisions.append(f"ALLOW (restricted user): {rel}")
+                else:
+                    violations.append(("restricted", rel))
+                    decisions.append(f"BLOCK (restricted user): {rel}")
+            continue
+
+        # Default allow
+        decisions.append(f"ALLOW (default): {rel}")
+
+    return decisions, violations
+
+# ================================ BYPASSES =================================
+
+def apply_freeze_bypass(violations, decisions, *, repo, policy, case_sensitive):
+    """
+    Apply freeze bypass (token+reason) for allowed users; mutates lists;
+    returns (bool ok, str err_or_None).
+    """
+    freeze_cfg = policy.get("freeze", {}) or {}
+    if not (freeze_cfg.get("enabled", False) and any(k=="freeze" for k,_ in violations)):
+        return False, None
+    me = current_user(case_sensitive)
+    allowed = freeze_cfg.get("allowed_users", []) or []
+    allowed = allowed if case_sensitive else [u.lower() for u in allowed]
+    tokens = freeze_cfg.get("tokens", []) or []
+    require_reason = bool(freeze_cfg.get("require_reason", True))
+
+    token = os.environ.get("DV_HOOK_BYPASS")
+    reason = (os.environ.get("DV_HOOK_BYPASS_REASON") or "").strip()
+    if not token: return False, None
+    if me not in allowed: return False, "Freeze bypass denied: user not permitted."
+    if require_reason and not reason: return False, "Freeze bypass denied: DV_HOOK_BYPASS_REASON required."
+
+    
+
+    tok_hash = sha256_hex(token)
+    candidate = next((t for t in tokens if str(t.get("sha256","")).lower()==tok_hash), None)
+    if not candidate: return False, "Freeze bypass denied: token not recognized."
+    exp = parse_date(candidate.get("expires"))
+    if exp and datetime.now() > exp: return False, "Freeze bypass denied: token expired."
+
+    ledger_path, ledger = load_ledger(repo)
+    max_uses = candidate.get("uses")
+    if isinstance(max_uses, int) and max_uses > 0:
+        used = sum(1 for e in ledger if e.get("token_sha256") == tok_hash)
+        if used >= max_uses:
+            return False, f"Bypass denied: token has reached its {max_uses} allowed uses."
+
+    if not bool(candidate.get("reusable", False)):
+        if any(e.get("token_sha256")==tok_hash for e in ledger):
+            return False, "Freeze bypass denied: one-time token already used."
+
+    ledger.append({
+        "ts": datetime.now().isoformat(timespec="seconds"), "user": me,
+        "token_sha256": tok_hash, "label": candidate.get("label"),
+        "reason": reason, "violations": [f for k,f in violations if k=="freeze"]
+    })
+    save_ledger(ledger_path, ledger)
+
+    for i, d in enumerate(decisions):
+        if d.startswith("BLOCK (freeze active):"):
+            decisions[i] = "BYPASS-ALLOW (freeze):" + d[len("BLOCK (freeze active):"):]
+    violations[:] = [(k,f) for k,f in violations if k!="freeze"]
+    return True, None
+
+def apply_emergency_bypass(violations, decisions, *, repo, policy, case_sensitive):
+    """
+    Apply emergency bypass (token+reason) for allowed users; mutates lists;
+    returns (bool ok, str err_or_None).
+    """
+    eb = policy.get("emergency_bypass", {}) or {}
+    if not (eb.get("enabled", False) and violations): return False, None
+    me = current_user(case_sensitive)
+    allowed = eb.get("allowed_users", []) or []
+    allowed = allowed if case_sensitive else [u.lower() for u in allowed]
+    tokens = eb.get("tokens", []) or []
+    require_reason = bool(eb.get("require_reason", True))
+
+    token = os.environ.get("DV_HOOK_BYPASS")
+    reason = (os.environ.get("DV_HOOK_BYPASS_REASON") or "").strip()
+    if not token: return False, None
+    if me not in allowed: return False, "Bypass denied: user not permitted."
+    if require_reason and not reason: return False, "Bypass denied: DV_HOOK_BYPASS_REASON required."
+
+    tok_hash = sha256_hex(token)
+    candidate = next((t for t in tokens if str(t.get("sha256","")).lower()==tok_hash), None)
+    if not candidate: return False, "Bypass denied: token not recognized."
+    exp = parse_date(candidate.get("expires"))
+    if exp and datetime.now() > exp: return False, "Bypass denied: token expired."
+
+    ledger_path, ledger = load_ledger(repo)
+    if not bool(candidate.get("reusable", False)):
+        if any(e.get("token_sha256")==tok_hash for e in ledger):
+            return False, "Bypass denied: one-time token already used."
+
+    ledger.append({
+        "ts": datetime.now().isoformat(timespec="seconds"), "user": me,
+        "token_sha256": tok_hash, "label": candidate.get("label"),
+        "reason": reason, "violations": [f for _,f in violations]
+    })
+    save_ledger(ledger_path, ledger)
+
+    for i, d in enumerate(decisions):
+        if d.startswith("BLOCK "):
+            decisions[i] = "BYPASS-ALLOW " + d[6:]
+    violations.clear()
+    return True, None
+
+# =============================== LOGGING / UI ===============================
+
+def write_decisions_log(log_abs, decisions, user):
+    """Append all decisions to the audit log with a timestamp and user."""
+    ensure_dir(log_abs)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(log_abs, "a", encoding="utf-8") as f:
+        for d in decisions:
+            f.write(f"[{ts}] {user}: {d}\n")
+
+def render_blocked_ui(
+    *, pal, repo, policy, log_abs, violations, admins,
+    show_admins, show_allowed, max_files_group, expand_env, abs_when_slash, case_sensitive
+):
+    """Render a grouped error UI explaining *why* files were blocked and how to proceed."""
+    me = current_user(case_sensitive)
+    groups = {"freeze": [], "admin_delete": [], "locked": [], "restricted": []}
+    for k, f in violations: groups.setdefault(k, []).append(f)
+
+    lines = [f"{pal['B']}User:{pal['RST']} {me}"]
+    if show_admins:
+        lines.append(f"{pal['B']}Config admins:{pal['RST']} {', '.join(admins) or '(none)'}")
+    lines += [
+        f"{pal['B']}Branch:{pal['RST']} {branch_name()}",
+        f"{pal['B']}Policy:{pal['RST']} {norm_posix(os.path.relpath(policy['_path'], repo))}",
+        f"{pal['B']}Log:{pal['RST']} {norm_posix(os.path.relpath(log_abs, repo))}",
+        "",
+    ]
+
+    def add_group(title, emoji, key):
+        files = groups.get(key) or []
+        if not files: return
+        count = len(files); lines.append(f"{emoji} {pal['B']}{title}{pal['RST']} ({count})")
+        shown = files[:max_files_group]
+        for p in shown:
+            reason = ""
+            if key == "locked":
+                reason = " — path matches a locked rule"
+            elif key == "restricted":
+                entry = first_matching_entry(
+                    policy.get("restricted", []),
+                    abspath_under(repo, p), repo, expand_env, abs_when_slash
+                )
+                allow = (entry or {}).get("allowed_users", [])
+                reason = f" — only allowed users: {', '.join(allow)}" if (allow and show_allowed) else " — user not allowed"
+            elif key == "admin_delete":
+                reason = " — deletes/renames in admin-only area"
+            elif key == "freeze":
+                reason = " — freeze window active"
+            lines.append(f"  • {p}{reason}")
+        if count > max_files_group:
+            lines.append(f"  … and {count - max_files_group} more")
+        lines.append("")
+
+    add_group("Locked paths", "🔒", "locked")
+    add_group("Restricted paths (user not allowed)", "👤", "restricted")
+    add_group("Admin-only deletions/renames", "🛑", "admin_delete")
+    add_group("Freeze active", "🧊", "freeze")
+
+    # Optional hints
+    opts_ui = (policy.get("options", {}) or {}).get("ui", {}) or {}
+    show_hints = bool(opts_ui.get("show_hints", True)) and not os.environ.get("DV_HOOK_MUTE")
+    if show_hints:
+        lines += [
+            f"{pal['B']}What you can do now{pal['RST']}:",
+            "  • Review staged files: git diff --cached --name-only",
+            "  • Unstage a file:      git restore --staged <path>",
+            "  • Commit allowed parts: git commit -m \"...\" (after unstaging blocked files)",
+        ]
+        eb = policy.get("emergency_bypass", {}) or {}
+        if eb.get("enabled"):
+            me_cmp = me if case_sensitive else me.lower()
+            allowed_cmp = (eb.get("allowed_users") or []) if case_sensitive else [u.lower() for u in (eb.get("allowed_users") or [])]
+            if me_cmp in allowed_cmp:
+                lines += [
+                    "  • If policy allows, you may bypass (audited):",
+                    "      DV_HOOK_BYPASS=\"<token>\" DV_HOOK_BYPASS_REASON=\"<why>\" git commit -m \"...\"",
+                ]
+        freeze_cfg = policy.get("freeze", {}) or {}
+        if freeze_cfg.get("enabled") and groups.get("freeze"):
+            lines += ["  • Freeze bypass is separate; use a valid freeze token (audited)."]
+        lines.append("")
+    ui_err("Pre-commit blocked by policy", "\n".join(lines))
+
+# =============================== SMOKE GATE ===============================
+
+def smoke_triggers(changes, *, repo, global_bypass_exts, expand_env, abs_when_slash, paths_compile_elab, sw_header_globs):
+    """Determine which smoke plans to run based on staged changes (compile/elab and/or SW headers)."""
+    need_ce = False; need_sw = False
+    for ch in changes:
+        rel = norm_posix(ch["new_path"] or ch["path"])
+        abs_p = abspath_under(repo, rel)
+        ext = ext_of(rel)
+        if ch["status"] in ("A","M","R") and ext in (".h",".hpp",".hh"):
+            for pat in (sw_header_globs or ["sw/**"]):
+                if path_match(pat, abs_p, repo, expand_env, abs_when_slash): need_sw = True
+        if ext not in global_bypass_exts:
+            for pat in (paths_compile_elab or ["tb/**"]):
+                if path_match(pat, abs_p, repo, expand_env, abs_when_slash): need_ce = True
+    plans = []
+    if need_ce: plans.append(("Compile+Elab", "ce"))
+    if need_sw: plans.append(("SW headers", "sw"))
+    return plans
+
+def smoke_run_sequence(seq_list, *, title, repo, smoke_shell, setup_csh, timeout, log_file):
+    """Run a command sequence (optionally via csh sourcing setup.csh); log output; return rc."""
+    ensure_dir(log_file)
+    start = datetime.now()
+    with open(log_file, "a", encoding="utf-8") as log:
+        log.write(f"\n=== {start.isoformat(timespec='seconds')} :: {title} ===\n")
+
+    if smoke_shell == "csh" and setup_csh:
+        joined = " && ".join(" ".join(map(str, cmd)) for cmd in seq_list)
+        cmd = ["csh", "-fc", f"source {setup_csh}; {joined}"]
+        try:
+            proc = subprocess.run(cmd, cwd=repo, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, timeout=timeout, **SUBPROC_TEXT_KW)
+            out, rc = proc.stdout, proc.returncode
+        except subprocess.TimeoutExpired:
+            out, rc = f"<TIMEOUT {timeout}s while running: {' '.join(cmd)}>\n", 124
+    else:
+        rc, chunks = 0, []
+        for sub in seq_list:
+            try:
+                p = subprocess.run(sub, cwd=repo, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, timeout=timeout, **SUBPROC_TEXT_KW)
+                chunks.append(f"$ {' '.join(map(str, sub))}\n{p.stdout}")
+                if p.returncode != 0: rc = p.returncode; break
+            except subprocess.TimeoutExpired:
+                chunks.append(f"$ {' '.join(map(str, sub))}\n<TIMEOUT after {timeout}s>\n")
+                rc = 124; break
+        out = "\n".join(chunks)
+
+    with open(log_file, "a", encoding="utf-8") as log:
+        log.write(out + "\n"); log.write(f"=== rc={rc} ===\n")
+    return rc
+
+def run_smoke_gate_if_needed(*, repo, policy, changes, log_abs, pal, expand_env, abs_when_slash, global_bypass_exts):
+    """Run smoke plans if triggered; block/warn depending on policy mode."""
+    smoke = policy.get("smoke_test", {}) or {}
+    if not smoke.get("enabled", False): return True
+
+    mode = str(smoke.get("mode","warn")).lower()
+    timeout = int(smoke.get("timeout_sec", 1200))
+    shell = smoke.get("shell","csh")
+    setup_csh = smoke.get("setup_csh")
+    paths_ce = smoke.get("paths_compile_elab", ["tb/**"])
+    cmds_ce = smoke.get("cmds_compile_elab", [["cdtc","cpuss__sanity"],["runTest","-do","compile"],["runTest","-do","elab"]])
+    hdr_globs = smoke.get("sw_header_globs", ["sw/**/*.h","sw/**/*.hpp","sw/**/*.hh"])
+    cmds_sw = smoke.get("cmds_sw", [["cdtc","cpuss__Sanity"],["runTest","-do","sw"]])
+
+    plans = smoke_triggers(changes, repo=repo, global_bypass_exts=global_bypass_exts,
+                           expand_env=expand_env, abs_when_slash=abs_when_slash,
+                           paths_compile_elab=paths_ce, sw_header_globs=hdr_globs)
+    if not plans: return True
+
+    smoke_log_abs = abspath_under(repo, policy.get("options",{}).get("log_path","simlog/precommit_access.log").replace("precommit_access.log","smoke.log"))
+    ctx = [f"{pal['B']}Reason(s){pal['RST']}: " + ", ".join([name for name,_ in plans]),
+           f"{pal['B']}Log{pal['RST']}: {norm_posix(os.path.relpath(smoke_log_abs, repo))}"]
+    print(box("🔎 Running smoke checks", ctx, "BLU", pal))
+
+    failures = []
+    for name, kind in plans:
+        seq = cmds_ce if kind=="ce" else cmds_sw
+        rc = smoke_run_sequence(seq, title=name, repo=repo, smoke_shell=shell,
+                                setup_csh=setup_csh, timeout=timeout, log_file=smoke_log_abs)
+        if rc != 0: failures.append((name, rc))
+
+    if failures:
+        if mode == "block":
+            lines = [f"{pal['B']}Failed check(s){pal['RST']}:"]
+            lines += [f"  • {n} (rc={rc})" for n,rc in failures]
+            lines.append(f"{pal['B']}See log{pal['RST']}: {norm_posix(os.path.relpath(smoke_log_abs, repo))}")
+            ui_err("Smoke checks failed", "\n".join(lines))
+            return False
+        else:
+            lines = [f"{pal['YEL']}Some smoke checks failed (commit allowed){pal['RST']}:"] + \
+                    [f"  • {n} (rc={rc})" for n,rc in failures] + \
+                    [f"{pal['B']}See log{pal['RST']}: {norm_posix(os.path.relpath(smoke_log_abs, repo))}"]
+            print("\n".join(lines))
+    else:
+        print(box("✅ Smoke checks passed", [], "GRN", pal))
+    return True
+
+# ================================== CONTEXT ==================================
+
+# existing at the top of the file
+# (keep your helpers as-is; we're going to use expand_policy_pattern)
+# def expand_policy_pattern(pat, repo, expand_env): ...
+def debug_dump_rules(repo, policy, expand_env):
+    """
+    Debug-print expanded rule patterns when DV_HOOK_DEBUG=1.
+
+    Supports:
+      - locked/restricted entries as dicts: {"path": "..."} or {"files": ["...","..."]}
+      - deletion_protected entries as plain strings or dicts
+    """
+    if os.environ.get("DV_HOOK_DEBUG") != "1":
+        return
+
+    def fmt_entry(entry):
+        # Dict form: {"path": "..."} or {"files":[...]}
+        if isinstance(entry, dict):
+            if "path" in entry:
+                raw = entry.get("path") or ""
+                exp = expand_policy_pattern(raw, repo, expand_env)
+                return f"path={raw!r} -> {exp!r}"
+            if "files" in entry:
+                raws = entry.get("files") or []
+                exps = [expand_policy_pattern(x, repo, expand_env) for x in raws]
+                return f"files={raws!r} -> {exps!r}"
+            return f"(dict without path/files: {entry!r})"
+
+        # String form: a single glob/pattern
+        if isinstance(entry, str):
+            raw = entry
+            exp = expand_policy_pattern(raw, repo, expand_env)
+            return f"pattern={raw!r} -> {exp!r}"
+
+        # Anything else
+        return f"(unsupported type {type(entry).__name__}: {entry!r})"
+
+    for key in ("locked", "restricted", "deletion_protected"):
+        entries = policy.get(key, []) or []
+        sys.stderr.write(f"[HOOK] rules.{key} (count={len(entries)}):\n")
+        for e in entries:
+            sys.stderr.write(f"  - {fmt_entry(e)}\n")
+
+def init_context():
+    repo = repo_root()
+    policy = load_policy(repo)
+    opts = policy.get("options", {}) or {}
+
+    # keep your RF_TOP defaulting logic
+    if bool(opts.get("force_rf_top_repo", True)) or not os.environ.get("RF_TOP"):
+        os.environ["RF_TOP"] = repo
+
+    color_on, show_hints, show_admins, show_allowed, max_files_group, mute, show_decisions, pal = \
+        load_ui_config(opts.get("ui", {}))
+
+    # 🔧 NEW: expand $RF_TOP (and other vars if expand_env) for log_path
+    expand_env = bool(opts.get("expand_env", True))
+    raw_log = opts.get("log_path", "simlog/precommit_access.log")
+    log_path_expanded = expand_policy_pattern(raw_log, repo, expand_env)
+    log_abs = abspath_under(repo, log_path_expanded)
+
+    ctx = {
+        "repo": repo,
+        "policy": policy,
+        "opts": opts,
+        "pal": pal,
+        "color_on": color_on,
+        "show_hints": show_hints,
+        "show_admins": show_admins,
+        "show_allowed": show_allowed,
+        "max_files_group": max_files_group,
+        "mute": mute,
+        "show_decisions": show_decisions,
+        "expand_env": expand_env,
+        "case_sensitive": bool(opts.get("case_sensitive_users", True)),
+        "abs_when_slash": bool(opts.get("treat_patterns_as_absolute_when_starting_with_slash", True)),
+        "log_abs": log_abs,
+    }
+
+    if os.environ.get("DV_HOOK_DEBUG") == "1":
+        sys.stderr.write(
+            "[HOOK] root=" + repo + "\n" +
+            "[HOOK] policy=" + policy.get("_path","?") + "\n" +
+            "[HOOK] log=" + log_abs + "\n" +                  
+            "[HOOK] RF_TOP=" + os.environ.get("RF_TOP","") + "\n"
+        )
+    return ctx
+
+# =================================== MAIN ===================================
+
+def main():
+    """Orchestrate: load context → prune → collect → protect → eval → bypass → log → smoke → verdict."""
+    C = init_context()
+    if not (C["policy"].get("locked") or C["policy"].get("restricted") or C["policy"].get("deletion_protected")):
+        sys.stderr.write("[HOOK] WARNING: policy has no locked/restricted/deletion_protected rules.\n")
+    debug_dump_rules(C["repo"], C["policy"], C["expand_env"])   
+
+    prune_dvshare(C["repo"], C["log_abs"])  # housekeeping
+
+    changes = staged_name_status()  # gather staged files
+
+    ok, err = protect_policy_file(  # protect policy file (never bypassable)
+        changes, repo=C["repo"], policy_path=C["policy"]["_path"],
+        admins=C["policy"].get("config_admins", []),
+        case_sensitive=C["case_sensitive"]
+    )
+    if not ok:
+        ui_err("Policy protected", err); sys.exit(1)
+
+    decisions, violations = evaluate_changes(  # policy evaluation
+        changes, repo=C["repo"], policy=C["policy"],
+        expand_env=C["expand_env"], case_sensitive=C["case_sensitive"],
+        abs_when_slash=C["abs_when_slash"]
+    )
+
+    # Debug: show decisions list if requested
+    if os.environ.get("DV_HOOK_DEBUG") == "1":
+        sys.stderr.write("[HOOK] decisions:\n  - " + "\n  - ".join(decisions) + "\n")
+
+    # Bypasses: freeze first, then emergency
+    bypassed, err = apply_freeze_bypass(violations, decisions,
+                                        repo=C["repo"], policy=C["policy"], case_sensitive=C["case_sensitive"])
+    if err: ui_err("Freeze bypass denied", err); sys.exit(1)
+
+    bypassed2, err2 = apply_emergency_bypass(violations, decisions,
+                                             repo=C["repo"], policy=C["policy"], case_sensitive=C["case_sensitive"])
+    if err2: ui_err("Bypass denied", err2); sys.exit(1)
+
+    # Audit log + optional decision print
+    write_decisions_log(C["log_abs"], decisions, current_user(C["case_sensitive"]))
+    if C["show_decisions"] and decisions:
+        print("\n".join([f"{C['pal']['DIM']}{d}{C['pal']['RST']}" for d in decisions]))
+
+    # If any violations remain, show UI and block
+    if violations:
+        render_blocked_ui(
+            pal=C["pal"], repo=C["repo"], policy=C["policy"], log_abs=C["log_abs"],
+            violations=violations, admins=C["policy"].get("config_admins", []),
+            show_admins=C["show_admins"], show_allowed=C["show_allowed"],
+            max_files_group=C["max_files_group"],
+            expand_env=C["expand_env"], abs_when_slash=C["abs_when_slash"],
+            case_sensitive=C["case_sensitive"]
+        )
+        sys.exit(1)
+
+    # Optional smoke checks
+    ok_smoke = run_smoke_gate_if_needed(
+        repo=C["repo"], policy=C["policy"], changes=changes, log_abs=C["log_abs"],
+        pal=C["pal"], expand_env=C["expand_env"], abs_when_slash=C["abs_when_slash"],
+        global_bypass_exts=to_ext_list(C["policy"].get("global_bypass", {}).get("allowed_extensions", []))
+    )
+    if not ok_smoke:
+        sys.exit(1)
+
+    # Success
+    if not C["mute"]:
+        ui_ok("Pre-commit policy check passed")
+    sys.exit(0)
+
+if __name__ == "__main__":
+    if sys.version_info < (3, 6):
+        print("ERROR: DV pre-commit hook requires Python 3.6+.", file=sys.stderr)
+        sys.exit(1)
+    main()
